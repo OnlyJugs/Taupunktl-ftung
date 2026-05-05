@@ -48,8 +48,8 @@ WINDOWS_S = (60, 300, 900)  # 1 min, 5 min, 15 min
 FAN_CHIP        = "/dev/gpiochip0"
 FAN_PIN         = 21      # BCM GPIO 21 (Header-Pin 40)
 FAN_ACTIVE_LOW  = True    # Treiberstufe schaltet bei LOW ein -> invertieren
-FAN_TD_ON       = 15.0    # °C – Lüfter EIN, sobald Taupunkt ≥ diesen Wert
-FAN_TD_OFF      = 15.0    # °C – Lüfter AUS, sobald Taupunkt < diesen Wert
+FAN_TD_ON       = 15.0    # °C – Lüfter EIN, sobald Taupunkt ≥ diesen Wert normal 15
+FAN_TD_OFF      = 10.0    # °C – Lüfter AUS, sobald Taupunkt < diesen Wert normal 15
 FAN_MIN_RUN_S   = 1      # Mindest-Laufzeit, sobald eingeschaltet
 FAN_MIN_PAUSE_S = 1      # Mindest-Pause nach dem Ausschalten
 FAN_AVG_WINDOW  = 0       # 0 = ungeglättet, sonst Sekunden für Mittelwert
