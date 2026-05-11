@@ -25,8 +25,8 @@ das deutlich zuverlässiger als reine Python-Bitbang-Bibliotheken.
 ### Start
 
 ```bash
-sudo python3 taupunkt.py                  # GPIO 26 (SERV01), Web-UI :8080
-sudo python3 taupunkt.py --pin 4          # eingebauter Joy-Pi-DHT
+sudo python3 taupunkt.py                  # GPIO 4 (Joy-Pi onboard), Web-UI :8080
+sudo python3 taupunkt.py --pin 26         # externer AM2302 an SERV01
 sudo python3 taupunkt.py --no-web         # ohne Web-Server
 ```
 
@@ -40,17 +40,7 @@ die jede Sekunde aktualisiert. Dort lassen sich die Hysterese-Schwellen
 (EIN/AUS) ändern und der Lüfter manuell EIN/AUS schalten bzw. wieder auf
 Automatik stellen.
 
-Voraussetzung: `pip install flask` (oder `sudo apt install python3-flask`).
-Ohne Flask startet das Skript trotzdem – nur ohne Web-UI.
-
-### Sensor finden
-
-Falls unklar ist, an welchem GPIO der eingebaute DHT hängt:
-
-```bash
-sudo python3 find_dht.py            # Standardliste 4, 17, 22, 26, 27
-sudo python3 find_dht.py 4 26       # eigene Pinliste
-```
+Voraussetzung: `pip install flask gpiod` (oder über `apt`).
 
 ### Beispielausgabe
 

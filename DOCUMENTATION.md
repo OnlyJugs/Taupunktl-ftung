@@ -4,8 +4,7 @@ Dieses Projekt entsteht auf einem **Raspberry Pi 4B** mit dem **Joy-Pi**-Aufsatz
 
 | Datei | Zweck |
 |-------|-------|
-| [taupunkt.py](taupunkt.py) | Liest Temperatur/Feuchte vom AM2302/DHT22-Sensor, berechnet den Taupunkt, steuert den Lüfter und stellt eine Web-UI bereit. |
-| [find_dht.py](find_dht.py) | Probiert mehrere GPIOs durch, um zu finden, an welchem Pin ein DHT-Sensor antwortet (z. B. der intern verdrahtete Joy-Pi-DHT auf GPIO 4). |
+| [taupunkt.py](taupunkt.py) | Liest Temperatur/Feuchte vom DHT-Sensor, berechnet den Taupunkt, steuert den Lüfter und stellt eine Web-UI bereit. |
 | [fan_test.py](fan_test.py) | Interaktiver Test eines Lüfters (oder anderen Aktors) per GPIO inkl. Software-PWM. |
 
 Langfristiges Ziel: anhand der Taupunkt-Differenz zwischen Innen- und Außensensor automatisch einen Lüfter ein- und ausschalten. Aktuell sind beide Bausteine getrennt – Sensorlesung und Aktor-Ansteuerung – und können unabhängig voneinander getestet werden.
@@ -20,11 +19,10 @@ Das Skript liest alle 3 Sekunden Temperatur und relative Luftfeuchte vom Sensor 
 
 ### 1.2 Hardware-Verdrahtung
 
-- Sensor: AM2302 (DHT22-kompatibel)
-- Anschluss: Joy-Pi-Buchse **SERV01**
-  - Signal-Pin = Header-Pin 37 = **BCM GPIO 26**
-  - VCC = +5 V, GND = GND
-- Falls der 3-polige Stecker verkehrt herum steckt, antwortet der Sensor schweigend – dann um 180° drehen.
+- Sensor: DHT22 / AM2302 (DHT11-kompatibler Kernel-Treiber).
+- Default: **eingebauter Joy-Pi-DHT auf BCM GPIO 4**.
+- Alternativ extern an Joy-Pi-Buchse **SERV01** (Header-Pin 37 = BCM GPIO 26) – dann `--pin 26` mitgeben.
+- Bei externem 3-poligem Stecker: antwortet der Sensor nicht, einmal um 180° drehen.
 
 ### 1.3 Implementierungsansatz
 
@@ -33,7 +31,7 @@ Statt einer reinen Python-Bitbang-Bibliothek (z. B. `Adafruit_DHT`) wird der **L
 Die Aktivierung erfolgt zur Laufzeit per `dtoverlay`:
 
 ```
-sudo dtoverlay dht11 gpiopin=26
+sudo dtoverlay dht11 gpiopin=4
 ```
 
 Der Treiber meldet sich danach im **IIO-Subsystem** als Gerät unter `/sys/bus/iio/devices/iio:deviceN`. Werte werden als reine Textdateien gelesen:
@@ -43,16 +41,16 @@ Der Treiber meldet sich danach im **IIO-Subsystem** als Gerät unter `/sys/bus/i
 
 ### 1.4 Code-Aufbau
 
-| Funktion | Beschreibung |
-|----------|--------------|
-| [sh()](taupunkt.py#L29) | Dünne Hülle um `subprocess.run` mit `capture_output`. |
-| [load_overlay()](taupunkt.py#L33) | Entlädt evtl. vorhandenes `dht11`-Overlay, lädt es neu mit dem gewünschten GPIO und wartet bis zu 5 s, bis das IIO-Device erscheint. |
-| [unload_overlay()](taupunkt.py#L43) | Räumt das Overlay beim Beenden wieder auf. |
-| [find_iio_device()](taupunkt.py#L47) | Sucht in `/sys/bus/iio/devices/` nach dem Gerät, dessen `name` mit `dht11` beginnt. |
-| [read_sensor()](taupunkt.py#L57) | Liest einmalig Temperatur und Feuchte; gibt `None` bei `OSError`/`ValueError` zurück. Konvertiert die m°C/m%-Werte in °C bzw. %. |
-| [read_sensor_retry()](taupunkt.py#L68) | Mehrfachversuch (Standard 4 ×, Pause 2,2 s) – AM2302 antwortet sporadisch nicht beim ersten Versuch. |
-| [taupunkt()](taupunkt.py#L78) | Berechnet den Taupunkt nach Magnus mit DWD-Konstanten $a=17{,}62$, $b=243{,}12\,°C$. Schützt mit `max(rh, 1e-3)` gegen `log(0)`. |
-| [main()](taupunkt.py#L85) | Lädt Overlay, sucht Device, druckt Header, läuft in Endlosschleife mit präzisem 3-s-Takt (`time.monotonic`-Kompensation), behandelt `SIGINT`/`SIGTERM`, entlädt das Overlay im `finally`-Block. |
+Das Modul ist bewusst kompakt gehalten (~250 Zeilen). Die wichtigsten Bausteine:
+
+| Symbol | Beschreibung |
+|--------|--------------|
+| `load_overlay()` / `unload_overlay()` | Laden/Entladen des `dht11`-Overlays, sucht das IIO-Device. |
+| `read_sensor()` | Liest Temperatur und Feuchte aus dem IIO-Sysfs, mehrere Versuche bei Lesefehlern. |
+| `dewpoint()` | Magnus-Formel mit DWD-Konstanten. |
+| `Fan` | Hysterese-Lüftersteuerung auf GPIO 21 mit thread-sicherem Override (`auto` / `on` / `off`). |
+| `build_app()` | Flask-App mit `/`, `/api/data`, `/api/settings`. |
+| `main()` | CLI, Overlay laden, Web-Thread starten, Messschleife (3 s), CSV-Logging, Cleanup. |
 
 ### 1.5 Magnus-Formel
 
@@ -66,7 +64,9 @@ mit $T$ = Lufttemperatur in °C, $\mathrm{RH}$ = relative Feuchte in %, $T_d$ = 
 ### 1.6 Start & Beenden
 
 ```bash
-sudo python3 taupunkt.py
+sudo python3 taupunkt.py            # Default: GPIO 4 (Joy-Pi onboard), Web :8080
+sudo python3 taupunkt.py --pin 26   # externer AM2302 an SERV01
+sudo python3 taupunkt.py --no-web   # ohne Web-UI
 ```
 
 `sudo` ist erforderlich, weil `dtoverlay` Root-Rechte verlangt. `STRG+C` beendet das Skript sauber; im `finally`-Zweig wird das Overlay wieder entfernt, sodass der GPIO frei ist.
@@ -74,16 +74,16 @@ sudo python3 taupunkt.py
 ### 1.7 Beispielausgabe
 
 ```
-Zeit        Temp °C  Feuchte %  Taupunkt °C
-----------------------------------------------
-08:56:02       26.2       33.0         8.65
-08:56:10       26.5       30.1         7.56
+Zeit        T °C   RH %   Td °C
+----------------------------------
+08:56:02     26.2   33.0     8.65
+08:56:10     26.5   30.1     7.56  [FAN]
 ```
 
 ### 1.8 Mögliche Fehlerquellen
 
-- **„Kernel-Treiber 'dht11' wurde nicht aktiv.“** – Overlay nicht geladen (kein `sudo`?), GPIO falsch, Sensor nicht angeschlossen.
-- **„Lesefehler – Sensor antwortet nicht.“** – Stecker verdreht, lange Leitung, fehlender Pull-up, oder zu schnelle Abfrage. `read_sensor_retry` mildert dies ab.
+- **„Kernel-Treiber 'dht11' nicht aktiv.“** – Overlay nicht geladen (kein `sudo`?), GPIO falsch, Sensor nicht angeschlossen.
+- **„Lesefehler.“** – Stecker verdreht, lange Leitung, fehlender Pull-up, oder zu schnelle Abfrage. `read_sensor` versucht es mehrfach.
 
 ---
 
@@ -143,35 +143,20 @@ gpiod.request_lines(
 
 ## 3. Zusammenspiel und Ausblick
 
-Beide Sensorlesung und Lüftersteuerung laufen mittlerweile in
-[taupunkt.py](taupunkt.py) zusammen. Zusätzlich startet das Skript einen
-kleinen **Flask-Webserver** (Default-Port 8080) mit Live-Anzeige der
-aktuellen Messwerte (Aktualisierung jede Sekunde via `fetch('/api/data')`).
-Die Web-UI erlaubt außerdem, die Hysterese-Schwellen
-($T_{d,\text{on}}$, $T_{d,\text{off}}$) zur Laufzeit zu ändern und den
-Lüfter manuell `EIN` / `AUS` zu schalten bzw. wieder in den Automatik-Modus
-zu versetzen. Die Manuell-Logik sitzt im `FanController` und wirkt
-unmittelbar – Mindest-Lauf-/Pausenzeiten greifen nur im Automatikmodus.
+Sensorlesung und Lüftersteuerung laufen gemeinsam in [taupunkt.py](taupunkt.py).
+Zusätzlich startet das Skript einen kleinen **Flask-Webserver** (Default-Port 8080)
+mit Live-Anzeige der aktuellen Messwerte (Aktualisierung jede Sekunde via
+`fetch('/api/data')`). Die Web-UI erlaubt außerdem, die Hysterese-Schwellen
+($T_{d,\text{on}}$, $T_{d,\text{off}}$) zur Laufzeit zu ändern und den Lüfter
+manuell `EIN` / `AUS` zu schalten bzw. wieder in den Automatik-Modus zu versetzen.
 
 ### Endpunkte
 
 | Endpoint | Methode | Zweck |
 |----------|---------|-------|
 | `/` | GET | HTML-Oberfläche mit Live-Daten und Override-Formular |
-| `/api/data` | GET | JSON: `{ last, fan_on, settings, history }` |
-| `/api/settings` | POST | JSON-Body mit `td_on`, `td_off`, `manual_mode` (`auto`/`on`/`off`) |
-
-### Sensor-Pin finden
-
-Auf dem Joy-Pi sitzt zusätzlich zum SERV01-Anschluss ein onboard
-verdrahteter DHT (laut Doku BCM GPIO 4). [find_dht.py](find_dht.py) lädt
-das `dht11`-Overlay nacheinander auf eine Liste Pins (Default: 4, 17, 22,
-26, 27) und meldet, auf welchen Pins der Treiber gültige Werte liest.
-
-```bash
-sudo python3 find_dht.py
-sudo python3 taupunkt.py --pin 4   # mit gefundenem Pin starten
-```
+| `/api/data` | GET | JSON: `{ last, fan, s }` (letzte Messung, Lüfterstatus, Settings) |
+| `/api/settings` | POST | JSON-Body mit `td_on`, `td_off`, `mode` (`auto`/`on`/`off`) |
 
 ### Weiter offen
 
@@ -190,7 +175,6 @@ sudo python3 taupunkt.py --pin 4   # mit gefundenem Pin starten
 ## 5. Dateiübersicht
 
 - [taupunkt.py](taupunkt.py) – Sensorlesung + Taupunktberechnung + Lüftersteuerung + Web-UI
-- [find_dht.py](find_dht.py) – Pin-Scan zum Auffinden eines DHT-Sensors
 - [fan_test.py](fan_test.py) – GPIO-/PWM-Test
 - [README.md](README.md) – Kurzanleitung (Hardware, Start, Magnus-Formel)
 - [DOCUMENTATION.md](DOCUMENTATION.md) – diese ausführliche Dokumentation
