@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
-"""Taupunktlüftung: liest DHT22/AM2302, berechnet Taupunkt, steuert Lüfter
-und bietet eine Live-Web-UI mit Override.
+"""Taupunktlüftung: liest zwei DHT22/AM2302-Sensoren (intern + extern),
+berechnet den Taupunkt, steuert einen Lüfter und bietet eine Live-Web-UI
+mit Override.
 
-Standard-Sensor: BCM GPIO 4 (Joy-Pi onboard).  Lüfter: BCM GPIO 21.
-Start:  sudo python3 taupunkt.py [--pin 4] [--port 8080] [--no-web]
+Standard-Setup:
+  intern : BCM GPIO 4   (Joy-Pi onboard)            -> Referenz / Zielwert
+  extern : BCM GPIO 26  (SERV01)                    -> der zu lüftende Raum
+  Lüfter : BCM GPIO 21  (active-low, Treiberstufe)
+
+Standardmodus ist "diff": Lüfter EIN sobald t_extern - t_intern >= diff_on,
+AUS sobald die Differenz <= diff_off. Zusätzlich gibt es Hand-Override
+(Lüfter AN / Lüfter AUS).
+
+Start:  sudo python3 taupunkt.py [--pin 4] [--pin-ext 26] [--no-ext]
+                                 [--port 8080] [--no-web]
 """
 from __future__ import annotations
 
@@ -23,16 +33,17 @@ from gpiod.line import Bias, Direction, Value
 from flask import Flask, jsonify, request
 
 # ---------- Konfiguration ---------------------------------------------------
-DHT_PIN        = 4               # BCM GPIO des DHT-Sensors
-INTERVAL_S     = 3.0             # Sensor-Takt
-LOG_DIR        = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tp_data")
+DHT_PIN_INT     = 4              # interner DHT (Joy-Pi onboard)
+DHT_PIN_EXT     = 26             # externer DHT (SERV01)
+INTERVAL_S      = 3.0            # Sensor-Takt
+LOG_DIR         = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tp_data")
 
-FAN_CHIP       = "/dev/gpiochip0"
-FAN_PIN        = 21              # BCM GPIO 21 (Header-Pin 40)
-FAN_ACTIVE_LOW = True            # Treiberstufe: LOW = an
-FAN_MIN_HOLD_S = 1.0             # min. Lauf-/Pausezeit
-DEFAULT_TD_ON  = 15.0
-DEFAULT_TD_OFF = 10.0
+FAN_CHIP        = "/dev/gpiochip0"
+FAN_PIN         = 21
+FAN_ACTIVE_LOW  = True
+FAN_MIN_HOLD_S  = 1.0
+DEFAULT_DIFF_ON  = 1.0           # ΔT (extern-intern) °C zum Einschalten
+DEFAULT_DIFF_OFF = 0.0           # ΔT zum Ausschalten
 
 WEB_HOST, WEB_PORT = "0.0.0.0", 8080
 
@@ -42,12 +53,14 @@ def sh(cmd: list[str], check: bool = True):
     return subprocess.run(cmd, check=check, capture_output=True, text=True)
 
 
-def load_overlay(pin: int) -> str:
-    sh(["sudo", "dtoverlay", "-r", "dht11"], check=False)
-    time.sleep(0.3)
-    sh(["sudo", "dtoverlay", "dht11", f"gpiopin={pin}"])
-    for _ in range(25):
-        for d in glob.glob("/sys/bus/iio/devices/iio:device*"):
+def _iio_devices() -> set[str]:
+    return set(glob.glob("/sys/bus/iio/devices/iio:device*"))
+
+
+def _wait_new_dht_device(before: set[str], timeout_s: float = 5.0) -> str:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        for d in _iio_devices() - before:
             try:
                 with open(os.path.join(d, "name")) as f:
                     if f.read().startswith("dht"):
@@ -55,7 +68,20 @@ def load_overlay(pin: int) -> str:
             except OSError:
                 pass
         time.sleep(0.2)
-    raise RuntimeError("Kernel-Treiber 'dht11' nicht aktiv (sudo nötig?).")
+    raise RuntimeError("Kein neues dht-IIO-Device erschienen.")
+
+
+def load_overlays(pins: list[int]) -> dict[int, str]:
+    """Lädt das dht11-Overlay je Pin und liefert {pin: iio-device-path}."""
+    sh(["sudo", "dtoverlay", "-r", "dht11"], check=False)
+    time.sleep(0.3)
+    devs: dict[int, str] = {}
+    for pin in pins:
+        before = _iio_devices()
+        sh(["sudo", "dtoverlay", "dht11", f"gpiopin={pin}"])
+        devs[pin] = _wait_new_dht_device(before)
+        print(f"  GPIO {pin:>2} -> {devs[pin]}")
+    return devs
 
 
 def unload_overlay() -> None:
@@ -86,14 +112,19 @@ def dewpoint(t: float, rh: float) -> float:
 
 # ---------- Lüfter -----------------------------------------------------------
 class Fan:
-    """Hysterese-Steuerung mit Manuell-Override (auto/on/off)."""
+    """Modi:
+      "diff" – Differenz-Regelung: EIN wenn (t_ext - t_int) >= diff_on,
+               AUS wenn (t_ext - t_int) <= diff_off.
+      "on"   – manuell EIN
+      "off"  – manuell AUS
+    """
 
     def __init__(self) -> None:
         self.on = False
         self.last_change = 0.0
-        self.td_on = DEFAULT_TD_ON
-        self.td_off = DEFAULT_TD_OFF
-        self.mode = "auto"        # "auto" | "on" | "off"
+        self.diff_on = DEFAULT_DIFF_ON
+        self.diff_off = DEFAULT_DIFF_OFF
+        self.mode = "diff"
         self.lock = threading.Lock()
         self._off = Value.ACTIVE if FAN_ACTIVE_LOW else Value.INACTIVE
         self._on = Value.INACTIVE if FAN_ACTIVE_LOW else Value.ACTIVE
@@ -109,36 +140,40 @@ class Fan:
         self.on = on
         self.last_change = time.monotonic()
 
-    def update(self, td: float) -> None:
+    def update(self, t_int: float | None, t_ext: float | None) -> None:
         with self.lock:
-            mode, on_th, off_th = self.mode, self.td_on, self.td_off
+            mode, on_th, off_th = self.mode, self.diff_on, self.diff_off
         if mode == "on" and not self.on:
             self._set(True)
-        elif mode == "off" and self.on:
+            return
+        if mode == "off" and self.on:
             self._set(False)
-        elif mode == "auto":
-            held = time.monotonic() - self.last_change
-            if not self.on and td >= on_th and held >= FAN_MIN_HOLD_S:
-                self._set(True)
-            elif self.on and td <= off_th and held >= FAN_MIN_HOLD_S:
-                self._set(False)
+            return
+        if mode != "diff" or t_int is None or t_ext is None:
+            return
+        delta = t_ext - t_int
+        held = time.monotonic() - self.last_change
+        if not self.on and delta >= on_th and held >= FAN_MIN_HOLD_S:
+            self._set(True)
+        elif self.on and delta <= off_th and held >= FAN_MIN_HOLD_S:
+            self._set(False)
 
     def settings(self) -> dict:
         with self.lock:
-            return {"td_on": self.td_on, "td_off": self.td_off, "mode": self.mode}
+            return {"diff_on": self.diff_on, "diff_off": self.diff_off, "mode": self.mode}
 
-    def configure(self, td_on=None, td_off=None, mode=None) -> None:
+    def configure(self, diff_on=None, diff_off=None, mode=None) -> None:
         with self.lock:
-            if td_on is not None:
-                self.td_on = float(td_on)
-            if td_off is not None:
-                self.td_off = float(td_off)
+            if diff_on is not None:
+                self.diff_on = float(diff_on)
+            if diff_off is not None:
+                self.diff_off = float(diff_off)
             if mode is not None:
-                if mode not in ("auto", "on", "off"):
+                if mode not in ("diff", "on", "off"):
                     raise ValueError(f"invalid mode: {mode}")
                 self.mode = mode
-            if self.td_off > self.td_on:
-                self.td_off, self.td_on = self.td_on, self.td_off
+            if self.diff_off > self.diff_on:
+                self.diff_off, self.diff_on = self.diff_on, self.diff_off
 
     def shutdown(self) -> None:
         try:
@@ -153,54 +188,73 @@ INDEX_HTML = """<!doctype html><html lang="de"><meta charset="utf-8">
 <title>Taupunktlüftung</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
- body{font-family:system-ui,sans-serif;max-width:640px;margin:1.5rem auto;padding:0 1rem}
- .grid{display:grid;grid-template-columns:1fr 1fr;gap:.75rem 1.5rem;margin:1rem 0}
- .v{font-size:1.6rem;font-weight:600}.l{opacity:.7;font-size:.85rem}
- .fan{padding:.4rem .8rem;border-radius:.5rem;color:#fff;font-weight:600}
- .fan.on{background:#2e7d32}.fan.off{background:#555}
+ body{font-family:system-ui,sans-serif;max-width:720px;margin:1.5rem auto;padding:0 1rem}
+ h2{margin:1.25rem 0 .25rem;font-size:1.05rem}
+ .grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:.5rem 1.25rem;margin:.25rem 0 1rem}
+ .v{font-size:1.4rem;font-weight:600}.l{opacity:.7;font-size:.8rem}
+ #fan.on{color:#2e7d32}#fan.off{color:#999}
+ .summary{display:grid;grid-template-columns:1fr 1fr;gap:.5rem 1.25rem}
  input[type=number]{width:6rem}label{display:block;margin:.35rem 0}
- button{padding:.45rem .9rem;margin-right:.5rem}
+ button{padding:.45rem .9rem}
 </style>
-<h1>Taupunktlüftung</h1><div class=l id=sub>warte auf Messwert…</div>
+<h1>Taupunktlüftung</h1>
+
+<h2>Sensor intern (GPIO 4)</h2>
 <div class=grid>
- <div><div class=l>Temperatur</div><div class=v id=t>–</div></div>
- <div><div class=l>Luftfeuchte</div><div class=v id=h>–</div></div>
- <div><div class=l>Taupunkt</div><div class=v id=td>–</div></div>
- <div><div class=l>Lüfter</div><div class=v><span id=fan class="fan off">–</span></div></div>
+ <div><div class=l>Temperatur</div><div class=v id=t1>–</div></div>
+ <div><div class=l>Luftfeuchte</div><div class=v id=h1>–</div></div>
+ <div><div class=l>Taupunkt</div><div class=v id=td1>–</div></div>
 </div>
-<fieldset><legend>Einstellungen / Override</legend><form id=f>
- <label>Schwelle EIN (°C): <input type=number step=0.1 name=td_on id=td_on></label>
- <label>Schwelle AUS (°C): <input type=number step=0.1 name=td_off id=td_off></label>
+
+<h2>Sensor extern (GPIO 26)</h2>
+<div class=grid>
+ <div><div class=l>Temperatur</div><div class=v id=t2>–</div></div>
+ <div><div class=l>Luftfeuchte</div><div class=v id=h2>–</div></div>
+ <div><div class=l>Taupunkt</div><div class=v id=td2>–</div></div>
+</div>
+
+<h2>Status</h2>
+<div class=summary>
+ <div><div class=l>ΔT (extern - intern)</div><div class=v id=dt>–</div></div>
+ <div><div class=l>Lüfter</div><div class="v off" id=fan>–</div></div>
+</div>
+
+<fieldset><legend>Einstellungen</legend><form id=f>
+ <label>ΔT EIN (°C): <input type=number step=0.1 name=diff_on id=diff_on></label>
+ <label>ΔT AUS (°C): <input type=number step=0.1 name=diff_off id=diff_off></label>
  <label>Modus:
   <select name=mode id=mm>
-   <option value=auto>Automatik</option>
-   <option value=on>manuell EIN</option>
-   <option value=off>manuell AUS</option>
+   <option value=diff>Automatik (Differenz)</option>
+   <option value=on>Lüfter AN</option>
+   <option value=off>Lüfter AUS</option>
   </select></label>
  <button>Speichern</button>
- <button type=button id=auto>Auf Automatik</button>
 </form></fieldset>
-<p class=l>Aktualisierung jede Sekunde. Sensor-Takt: 3 s.</p>
+
 <script>
 const $=id=>document.getElementById(id);
 const set=(id,v)=>{const e=$(id);if(document.activeElement!==e)e.value=v};
+function show(s,t,h,td){
+ $(t).textContent = s ? s.t.toFixed(1)+' °C' : '–';
+ $(h).textContent = s ? s.h.toFixed(1)+' %' : '–';
+ $(td).textContent= s ? s.td.toFixed(2)+' °C' : '–';
+}
 async function refresh(){
  try{
   const d=await(await fetch('/api/data',{cache:'no-store'})).json();
-  $('sub').textContent=d.last?'Letzte Messung: '+d.last.iso:'warte auf Messwert…';
-  if(d.last){$('t').textContent=d.last.t.toFixed(1)+' °C';
-   $('h').textContent=d.last.h.toFixed(1)+' %';
-   $('td').textContent=d.last.td.toFixed(2)+' °C';}
-  const f=$('fan');f.textContent=d.fan?'EIN':'AUS';f.className='fan '+(d.fan?'on':'off');
-  set('td_on',d.s.td_on);set('td_off',d.s.td_off);
+  show(d.int,'t1','h1','td1');
+  show(d.ext,'t2','h2','td2');
+  $('dt').textContent = (d.int&&d.ext)
+    ? ((d.ext.t-d.int.t)>=0?'+':'')+(d.ext.t-d.int.t).toFixed(2)+' °C'
+    : '–';
+  const f=$('fan');f.textContent=d.fan?'EIN':'AUS';f.className='v '+(d.fan?'on':'off');
+  set('diff_on',d.s.diff_on);set('diff_off',d.s.diff_off);
   if(document.activeElement!==$('mm'))$('mm').value=d.s.mode;
- }catch(e){$('sub').textContent='Verbindung verloren…';}
+ }catch(e){}
 }
 $('f').onsubmit=async e=>{e.preventDefault();
  await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
   body:JSON.stringify(Object.fromEntries(new FormData(e.target)))});refresh();};
-$('auto').onclick=async()=>{await fetch('/api/settings',{method:'POST',
- headers:{'Content-Type':'application/json'},body:'{"mode":"auto"}'});refresh();};
 refresh();setInterval(refresh,1000);
 </script></html>"""
 
@@ -216,14 +270,15 @@ def build_app(state: dict, fan: Fan) -> Flask:
 
     @app.get("/api/data")
     def _data():
-        return jsonify({"last": state.get("last"), "fan": fan.on, "s": fan.settings()})
+        return jsonify({"int": state.get("int"), "ext": state.get("ext"),
+                        "fan": fan.on, "s": fan.settings()})
 
     @app.post("/api/settings")
     def _settings():
         data = request.get_json(silent=True) or request.form.to_dict()
         try:
-            fan.configure(td_on=data.get("td_on") or None,
-                          td_off=data.get("td_off") or None,
+            fan.configure(diff_on=data.get("diff_on") or None,
+                          diff_off=data.get("diff_off") or None,
                           mode=data.get("mode") or None)
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
@@ -240,26 +295,44 @@ def open_log() -> tuple[object, csv.writer]:
     f = open(path, "a", newline="", buffering=1)
     w = csv.writer(f)
     if new:
-        w.writerow(["timestamp", "iso_time", "temp_c", "humidity_pct", "dewpoint_c", "fan_on"])
+        w.writerow(["timestamp", "iso_time",
+                    "t_int", "h_int", "td_int",
+                    "t_ext", "h_ext", "td_ext",
+                    "fan_on"])
     print(f"Logfile: {path}")
     return f, w
 
 
+def sample(dev: str | None) -> dict | None:
+    if dev is None:
+        return None
+    werte = read_sensor(dev)
+    if werte is None:
+        return None
+    t, h = werte
+    return {"t": t, "h": h, "td": dewpoint(t, h)}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Taupunktlüftung mit Web-UI")
-    ap.add_argument("--pin", type=int, default=DHT_PIN)
+    ap.add_argument("--pin", type=int, default=DHT_PIN_INT, help="interner DHT (Default: 4)")
+    ap.add_argument("--pin-ext", type=int, default=DHT_PIN_EXT, help="externer DHT (Default: 26)")
+    ap.add_argument("--no-ext", action="store_true", help="ohne zweiten Sensor")
     ap.add_argument("--port", type=int, default=WEB_PORT)
     ap.add_argument("--host", default=WEB_HOST)
     ap.add_argument("--no-web", action="store_true")
     args = ap.parse_args()
 
-    print(f"Lade dht11-Overlay auf GPIO {args.pin} …")
+    pins = [args.pin] + ([] if args.no_ext else [args.pin_ext])
+    print(f"Lade dht11-Overlays für GPIOs {pins} …")
     try:
-        dev = load_overlay(args.pin)
+        devs = load_overlays(pins)
     except (subprocess.CalledProcessError, RuntimeError) as e:
         print(f"Fehler: {e}", file=sys.stderr)
         return 1
-    print(f"Sensor-Device: {dev}\nSTRG+C zum Beenden.\n")
+    dev_int = devs[args.pin]
+    dev_ext = devs.get(args.pin_ext) if not args.no_ext else None
+    print("STRG+C zum Beenden.\n")
 
     log_f, log_w = open_log()
     fan = Fan()
@@ -274,25 +347,37 @@ def main() -> int:
         ).start()
         print(f"Web-UI: http://{args.host}:{args.port}/")
 
-    print(f"{'Zeit':<10} {'T °C':>6} {'RH %':>6} {'Td °C':>7}")
-    print("-" * 34)
+    print(f"{'Zeit':<10} {'T-int':>6} {'T-ext':>6} {'ΔT':>6} {'Td-int':>7} {'Td-ext':>7}")
+    print("-" * 50)
     try:
         while True:
             t0 = time.monotonic()
-            werte = read_sensor(dev)
+            si = sample(dev_int)
+            se = sample(dev_ext)
             now = time.time()
             iso = datetime.fromtimestamp(now).isoformat(timespec="seconds")
-            if werte is None:
-                print(f"{iso[11:]:<10}  Lesefehler.")
-            else:
-                t, h = werte
-                td = dewpoint(t, h)
-                fan.update(td)
-                state["last"] = {"ts": now, "iso": iso, "t": t, "h": h, "td": td}
-                log_w.writerow([f"{now:.0f}", iso, f"{t:.2f}", f"{h:.2f}",
-                                f"{td:.2f}", "1" if fan.on else "0"])
-                tag = "[FAN]" if fan.on else "     "
-                print(f"{iso[11:]:<10} {t:>6.1f} {h:>6.1f} {td:>7.2f}  {tag}")
+            state["int"] = si
+            state["ext"] = se
+            fan.update(si["t"] if si else None, se["t"] if se else None)
+
+            def fmt(v, w, p):
+                return f"{v:>{w}.{p}f}" if v is not None else f"{'–':>{w}}"
+            ti = si["t"] if si else None
+            te = se["t"] if se else None
+            dt = (te - ti) if (ti is not None and te is not None) else None
+            print(f"{iso[11:]:<10} {fmt(ti,6,1)} {fmt(te,6,1)} {fmt(dt,6,2)} "
+                  f"{fmt(si['td'] if si else None,7,2)} "
+                  f"{fmt(se['td'] if se else None,7,2)}  "
+                  f"{'[FAN]' if fan.on else ''}")
+
+            log_w.writerow([
+                f"{now:.0f}", iso,
+                f"{si['t']:.2f}" if si else "", f"{si['h']:.2f}" if si else "",
+                f"{si['td']:.2f}" if si else "",
+                f"{se['t']:.2f}" if se else "", f"{se['h']:.2f}" if se else "",
+                f"{se['td']:.2f}" if se else "",
+                "1" if fan.on else "0",
+            ])
             time.sleep(max(0.0, INTERVAL_S - (time.monotonic() - t0)))
     except KeyboardInterrupt:
         print("\nBeendet.")
