@@ -75,11 +75,13 @@ class MockFan:
             return {"diff_on": self.diff_on, "diff_off": self.diff_off, "mode": self.mode}
 
     def configure(self, diff_on=None, diff_off=None, mode=None) -> None:
+        def _f(v):
+            return float(str(v).replace(",", ".").strip())
         with self.lock:
             if diff_on is not None:
-                self.diff_on = float(diff_on)
+                self.diff_on = _f(diff_on)
             if diff_off is not None:
-                self.diff_off = float(diff_off)
+                self.diff_off = _f(diff_off)
             if mode is not None:
                 if mode not in ("diff", "on", "off"):
                     raise ValueError(mode)

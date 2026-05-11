@@ -1,22 +1,15 @@
 #!/usr/bin/env python3
-"""Taupunktlüftung: liest zwei DHT22/AM2302-Sensoren (intern + extern),
-berechnet den Taupunkt, steuert einen Lüfter und bietet eine Live-Web-UI
-mit Override.
+"""Taupunktlüftung für den Joy-Pi.
 
-Standard-Setup:
-  intern : BCM GPIO 4   (Joy-Pi onboard)            -> Referenz / Zielwert
-  extern : BCM GPIO 26  (SERV01)                    -> der zu lüftende Raum
-  Lüfter : BCM GPIO 21  (active-low, Treiberstufe)
+Wichtig:
+	GPIO 4  [DHT intern]
+    GPIO 26 [DHT extern]
+    GPIO 21 [Lüfter]
 
-Standardmodus ist "diff": Lüfter EIN sobald t_extern - t_intern >= diff_on,
-AUS sobald die Differenz <= diff_off. Zusätzlich gibt es Hand-Override
-(Lüfter AN / Lüfter AUS).
-
-Start:  sudo python3 taupunkt.py [--pin 4] [--pin-ext 26] [--no-ext]
-                                 [--port 8080] [--no-web]
+Aufruf:
+    sudo python3 taupunkt.py
+    sudo python3 taupunkt.py --no-ext --port 8000
 """
-from __future__ import annotations
-
 import argparse
 import csv
 import glob
@@ -32,65 +25,72 @@ import gpiod
 from gpiod.line import Bias, Direction, Value
 from flask import Flask, jsonify, request
 
-# ---------- Konfiguration ---------------------------------------------------
-DHT_PIN_INT     = 4              # interner DHT (Joy-Pi onboard)
-DHT_PIN_EXT     = 26             # externer DHT (SERV01)
-INTERVAL_S      = 3.0            # Sensor-Takt
-LOG_DIR         = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tp_data")
 
-FAN_CHIP        = "/dev/gpiochip0"
-FAN_PIN         = 21
-FAN_ACTIVE_LOW  = True
-FAN_MIN_HOLD_S  = 1.0
-DEFAULT_DIFF_ON  = 1.0           # ΔT (extern-intern) °C zum Einschalten
-DEFAULT_DIFF_OFF = 0.0           # ΔT zum Ausschalten
+# --- Konfiguration ---------------------------------------------------------
+PIN_INTERN = 4
+PIN_EXTERN = 26
+FAN_PIN    = 21
+FAN_ACTIVE_LOW = True       # MOSFET-Treiber: LOW schaltet ein
+FAN_CHIP   = "/dev/gpiochip0"
 
-WEB_HOST, WEB_PORT = "0.0.0.0", 8080
+LOOP_INTERVAL  = 3.0        # Sekunden zwischen Messungen
+FAN_MIN_HOLD   = 1.0        # Mindesthaltezeit gegen Flattern
+DIFF_ON_DEFAULT  = 5.0      # Lüfter EIN ab ΔT (extern - intern) °C
+DIFF_OFF_DEFAULT = 0.0      # Lüfter AUS bei ΔT ≤ … °C
+
+WEB_HOST = "0.0.0.0"
+WEB_PORT = 8080
+LOG_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tp_data")
 
 
-# ---------- DHT via Kernel-Overlay ------------------------------------------
-def sh(cmd: list[str], check: bool = True):
+# --- DHT über Kernel-Overlay ----------------------------------------------
+# Der dht11-Overlay-Treiber legt jedes Sensor-Gerät unter
+# /sys/bus/iio/devices/iio:device* ab. Wir laden ihn pro Pin einmal und
+# merken uns, welches Device neu dazugekommen ist.
+
+def run(cmd, check=True):
     return subprocess.run(cmd, check=check, capture_output=True, text=True)
 
 
-def _iio_devices() -> set[str]:
+def iio_devices():
     return set(glob.glob("/sys/bus/iio/devices/iio:device*"))
 
 
-def _wait_new_dht_device(before: set[str], timeout_s: float = 5.0) -> str:
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        for d in _iio_devices() - before:
+def wait_for_new_dht(known, timeout=5.0):
+    """Wartet bis zu ``timeout`` s auf ein neues iio-Device mit Namen 'dht…'."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        for dev in iio_devices() - known:
             try:
-                with open(os.path.join(d, "name")) as f:
+                with open(os.path.join(dev, "name")) as f:
                     if f.read().startswith("dht"):
-                        return d
+                        return dev
             except OSError:
-                pass
+                continue
         time.sleep(0.2)
-    raise RuntimeError("Kein neues dht-IIO-Device erschienen.")
+    raise RuntimeError("Kein neues dht-Device aufgetaucht.")
 
 
-def load_overlays(pins: list[int]) -> dict[int, str]:
-    """Lädt das dht11-Overlay je Pin und liefert {pin: iio-device-path}."""
-    sh(["sudo", "dtoverlay", "-r", "dht11"], check=False)
+def load_overlays(pins):
+    """Lädt das dht11-Overlay je Pin und liefert {pin: device_pfad}."""
+    run(["sudo", "dtoverlay", "-r", "dht11"], check=False)
     time.sleep(0.3)
-    devs: dict[int, str] = {}
+    mapping = {}
     for pin in pins:
-        before = _iio_devices()
-        sh(["sudo", "dtoverlay", "dht11", f"gpiopin={pin}"])
-        devs[pin] = _wait_new_dht_device(before)
-        print(f"  GPIO {pin:>2} -> {devs[pin]}")
-    return devs
+        before = iio_devices()
+        run(["sudo", "dtoverlay", "dht11", f"gpiopin={pin}"])
+        mapping[pin] = wait_for_new_dht(before)
+        print(f"  GPIO {pin:>2}  →  {mapping[pin]}")
+    return mapping
 
 
-def unload_overlay() -> None:
-    sh(["sudo", "dtoverlay", "-r", "dht11"], check=False)
+def unload_overlays():
+    run(["sudo", "dtoverlay", "-r", "dht11"], check=False)
 
 
-def read_sensor(dev: str, tries: int = 4) -> tuple[float, float] | None:
-    """Liest (T °C, RH %). Bis zu ``tries`` Versuche – AM2302 ist sporadisch."""
-    for i in range(tries):
+def read_dht(dev, tries=4):
+    """Liefert (T °C, RH %) oder None. DHT22 antwortet nicht jedes Mal."""
+    for attempt in range(tries):
         try:
             with open(os.path.join(dev, "in_temp_input")) as f:
                 t = int(f.read()) / 1000.0
@@ -98,92 +98,105 @@ def read_sensor(dev: str, tries: int = 4) -> tuple[float, float] | None:
                 h = int(f.read()) / 1000.0
             return t, h
         except (OSError, ValueError):
-            if i < tries - 1:
+            if attempt < tries - 1:
                 time.sleep(2.2)
     return None
 
 
-def dewpoint(t: float, rh: float) -> float:
-    """Taupunkt °C nach Magnus (DWD-Konstanten)."""
+def dewpoint(temp_c, rh):
+    """Taupunkt nach Magnus-Formel mit DWD-Konstanten."""
     a, b = 17.62, 243.12
-    g = a * t / (b + t) + math.log(max(rh, 1e-3) / 100.0)
-    return b * g / (a - g)
+    gamma = a * temp_c / (b + temp_c) + math.log(max(rh, 1e-3) / 100.0)
+    return b * gamma / (a - gamma)
 
 
-# ---------- Lüfter -----------------------------------------------------------
+# --- Lüfter ---------------------------------------------------------------
 class Fan:
-    """Modi:
-      "diff" – Differenz-Regelung: EIN wenn (t_ext - t_int) >= diff_on,
-               AUS wenn (t_ext - t_int) <= diff_off.
-      "on"   – manuell EIN
-      "off"  – manuell AUS
+    """GPIO-Lüfter mit drei Modi.
+
+    diff  – Automatik: an bei (t_ext - t_int) ≥ diff_on, aus bei ≤ diff_off
+    on    – Handbetrieb: immer an
+    off   – Handbetrieb: immer aus
     """
 
-    def __init__(self) -> None:
+    def __init__(self):
         self.on = False
         self.last_change = 0.0
-        self.diff_on = DEFAULT_DIFF_ON
-        self.diff_off = DEFAULT_DIFF_OFF
+        self.diff_on  = DIFF_ON_DEFAULT
+        self.diff_off = DIFF_OFF_DEFAULT
         self.mode = "diff"
         self.lock = threading.Lock()
-        self._off = Value.ACTIVE if FAN_ACTIVE_LOW else Value.INACTIVE
-        self._on = Value.INACTIVE if FAN_ACTIVE_LOW else Value.ACTIVE
+
+        self._level_off = Value.ACTIVE   if FAN_ACTIVE_LOW else Value.INACTIVE
+        self._level_on  = Value.INACTIVE if FAN_ACTIVE_LOW else Value.ACTIVE
         self.req = gpiod.request_lines(
-            FAN_CHIP, consumer="taupunkt-fan",
+            FAN_CHIP,
+            consumer="taupunkt-fan",
             config={FAN_PIN: gpiod.LineSettings(
-                direction=Direction.OUTPUT, output_value=self._off,
-                bias=Bias.PULL_UP if FAN_ACTIVE_LOW else Bias.PULL_DOWN)},
+                direction=Direction.OUTPUT,
+                output_value=self._level_off,
+                bias=Bias.PULL_UP if FAN_ACTIVE_LOW else Bias.PULL_DOWN,
+            )},
         )
 
-    def _set(self, on: bool) -> None:
-        self.req.set_value(FAN_PIN, self._on if on else self._off)
+    def _switch(self, on):
+        self.req.set_value(FAN_PIN, self._level_on if on else self._level_off)
         self.on = on
         self.last_change = time.monotonic()
 
-    def update(self, t_int: float | None, t_ext: float | None) -> None:
+    def update(self, t_int, t_ext):
         with self.lock:
             mode, on_th, off_th = self.mode, self.diff_on, self.diff_off
-        if mode == "on" and not self.on:
-            self._set(True)
+
+        if mode == "on":
+            if not self.on:
+                self._switch(True)
             return
-        if mode == "off" and self.on:
-            self._set(False)
+        if mode == "off":
+            if self.on:
+                self._switch(False)
             return
-        if mode != "diff" or t_int is None or t_ext is None:
+        # Automatik
+        if t_int is None or t_ext is None:
             return
         delta = t_ext - t_int
-        held = time.monotonic() - self.last_change
-        if not self.on and delta >= on_th and held >= FAN_MIN_HOLD_S:
-            self._set(True)
-        elif self.on and delta <= off_th and held >= FAN_MIN_HOLD_S:
-            self._set(False)
+        if time.monotonic() - self.last_change < FAN_MIN_HOLD:
+            return
+        if not self.on and delta >= on_th:
+            self._switch(True)
+        elif self.on and delta <= off_th:
+            self._switch(False)
 
-    def settings(self) -> dict:
+    def settings(self):
         with self.lock:
             return {"diff_on": self.diff_on, "diff_off": self.diff_off, "mode": self.mode}
 
-    def configure(self, diff_on=None, diff_off=None, mode=None) -> None:
+    def configure(self, diff_on=None, diff_off=None, mode=None):
+        def number(v):
+            return float(str(v).replace(",", ".").strip())
+
         with self.lock:
             if diff_on is not None:
-                self.diff_on = float(diff_on)
+                self.diff_on = number(diff_on)
             if diff_off is not None:
-                self.diff_off = float(diff_off)
+                self.diff_off = number(diff_off)
             if mode is not None:
                 if mode not in ("diff", "on", "off"):
-                    raise ValueError(f"invalid mode: {mode}")
+                    raise ValueError(f"Unbekannter Modus: {mode}")
                 self.mode = mode
+            # AUS-Schwelle darf nicht über der EIN-Schwelle liegen
             if self.diff_off > self.diff_on:
                 self.diff_off, self.diff_on = self.diff_on, self.diff_off
 
-    def shutdown(self) -> None:
+    def shutdown(self):
         try:
-            self.req.set_value(FAN_PIN, self._off)
+            self.req.set_value(FAN_PIN, self._level_off)
             self.req.release()
         except Exception:
             pass
 
 
-# ---------- Web-UI -----------------------------------------------------------
+# --- Web-UI ---------------------------------------------------------------
 INDEX_HTML = """<!doctype html><html lang="de"><meta charset="utf-8">
 <title>Taupunktlüftung</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -192,9 +205,7 @@ INDEX_HTML = """<!doctype html><html lang="de"><meta charset="utf-8">
  h2{margin:1.25rem 0 .25rem;font-size:1.05rem}
  .grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:.5rem 1.25rem;margin:.25rem 0 1rem}
  .v{font-size:1.4rem;font-weight:600}.l{opacity:.7;font-size:.8rem}
- #fan.on{color:#2e7d32}#fan.off{color:#999}
- .summary{display:grid;grid-template-columns:1fr 1fr;gap:.5rem 1.25rem}
- input[type=number]{width:6rem}label{display:block;margin:.35rem 0}
+ input[type=text]{width:6rem}label{display:block;margin:.35rem 0}
  button{padding:.45rem .9rem}
 </style>
 <h1>Taupunktlüftung</h1>
@@ -214,14 +225,15 @@ INDEX_HTML = """<!doctype html><html lang="de"><meta charset="utf-8">
 </div>
 
 <h2>Status</h2>
-<div class=summary>
+<div class=grid>
  <div><div class=l>ΔT (extern - intern)</div><div class=v id=dt>–</div></div>
- <div><div class=l>Lüfter</div><div class="v off" id=fan>–</div></div>
+ <div><div class=l>Lüfter</div><div class=v id=fan>–</div></div>
+ <div></div>
 </div>
 
 <fieldset><legend>Einstellungen</legend><form id=f>
- <label>ΔT EIN (°C): <input type=number step=0.1 name=diff_on id=diff_on></label>
- <label>ΔT AUS (°C): <input type=number step=0.1 name=diff_off id=diff_off></label>
+ <label>ΔT EIN (°C): <input type=text inputmode=decimal name=diff_on id=diff_on></label>
+ <label>ΔT AUS (°C): <input type=text inputmode=decimal name=diff_off id=diff_off></label>
  <label>Modus:
   <select name=mode id=mm>
    <option value=diff>Automatik (Differenz)</option>
@@ -232,54 +244,87 @@ INDEX_HTML = """<!doctype html><html lang="de"><meta charset="utf-8">
 </form></fieldset>
 
 <script>
-const $=id=>document.getElementById(id);
-const set=(id,v)=>{const e=$(id);if(document.activeElement!==e)e.value=v};
-function show(s,t,h,td){
- $(t).textContent = s ? s.t.toFixed(1)+' °C' : '–';
- $(h).textContent = s ? s.h.toFixed(1)+' %' : '–';
- $(td).textContent= s ? s.td.toFixed(2)+' °C' : '–';
+const $ = id => document.getElementById(id);
+let dirty = false;
+
+function fillIfIdle(id, v){
+  const el = $(id);
+  if (!dirty && document.activeElement !== el) el.value = v;
 }
+
+function showSensor(s, tId, hId, tdId){
+  $(tId).textContent  = s ? s.t.toFixed(1)  + ' °C' : '–';
+  $(hId).textContent  = s ? s.h.toFixed(1)  + ' %'  : '–';
+  $(tdId).textContent = s ? s.td.toFixed(2) + ' °C' : '–';
+}
+
 async function refresh(){
- try{
-  const d=await(await fetch('/api/data',{cache:'no-store'})).json();
-  show(d.int,'t1','h1','td1');
-  show(d.ext,'t2','h2','td2');
-  $('dt').textContent = (d.int&&d.ext)
-    ? ((d.ext.t-d.int.t)>=0?'+':'')+(d.ext.t-d.int.t).toFixed(2)+' °C'
-    : '–';
-  const f=$('fan');f.textContent=d.fan?'EIN':'AUS';f.className='v '+(d.fan?'on':'off');
-  set('diff_on',d.s.diff_on);set('diff_off',d.s.diff_off);
-  if(document.activeElement!==$('mm'))$('mm').value=d.s.mode;
- }catch(e){}
+  try {
+    const d = await (await fetch('/api/data', {cache:'no-store'})).json();
+    showSensor(d.int, 't1','h1','td1');
+    showSensor(d.ext, 't2','h2','td2');
+    if (d.int && d.ext) {
+      const delta = d.ext.t - d.int.t;
+      $('dt').textContent = (delta >= 0 ? '+' : '') + delta.toFixed(2) + ' °C';
+    } else {
+      $('dt').textContent = '–';
+    }
+    $('fan').textContent = d.fan ? 'EIN' : 'AUS';
+    fillIfIdle('diff_on',  d.s.diff_on);
+    fillIfIdle('diff_off', d.s.diff_off);
+    if (!dirty && document.activeElement !== $('mm')) $('mm').value = d.s.mode;
+  } catch (e) { /* ignorieren – nächster Tick versucht es erneut */ }
 }
-$('f').onsubmit=async e=>{e.preventDefault();
- await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify(Object.fromEntries(new FormData(e.target)))});refresh();};
-refresh();setInterval(refresh,1000);
+
+for (const el of document.querySelectorAll('#f input, #f select'))
+  el.addEventListener('input', () => { dirty = true; });
+
+$('f').onsubmit = async e => {
+  e.preventDefault();
+  const payload = Object.fromEntries(new FormData(e.target));
+  for (const k of ['diff_on','diff_off'])
+    if (payload[k]) payload[k] = String(payload[k]).replace(',', '.');
+  await fetch('/api/settings', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(payload),
+  });
+  dirty = false;
+  refresh();
+};
+
+refresh();
+setInterval(refresh, 1000);
 </script></html>"""
 
 
-def build_app(state: dict, fan: Fan) -> Flask:
+def build_app(state, fan):
     app = Flask(__name__)
     import logging
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
     @app.get("/")
-    def _():
+    def index():
         return INDEX_HTML
 
     @app.get("/api/data")
-    def _data():
-        return jsonify({"int": state.get("int"), "ext": state.get("ext"),
-                        "fan": fan.on, "s": fan.settings()})
+    def api_data():
+        return jsonify({
+            "int": state.get("int"),
+            "ext": state.get("ext"),
+            "fan": fan.on,
+            "s":   fan.settings(),
+        })
 
     @app.post("/api/settings")
-    def _settings():
+    def api_settings():
         data = request.get_json(silent=True) or request.form.to_dict()
         try:
-            fan.configure(diff_on=data.get("diff_on") or None,
-                          diff_off=data.get("diff_off") or None,
-                          mode=data.get("mode") or None)
+            fan.configure(
+                diff_on  = data.get("diff_on")  or None,
+                diff_off = data.get("diff_off") or None,
+                mode     = data.get("mode")     or None,
+            )
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
         return jsonify({"ok": True, "s": fan.settings()})
@@ -287,104 +332,127 @@ def build_app(state: dict, fan: Fan) -> Flask:
     return app
 
 
-# ---------- Hauptprogramm ---------------------------------------------------
-def open_log() -> tuple[object, csv.writer]:
+# --- Logging --------------------------------------------------------------
+def open_logfile():
     os.makedirs(LOG_DIR, exist_ok=True)
-    path = os.path.join(LOG_DIR, f"tp_{datetime.now().strftime('%Y-%m-%d')}.csv")
-    new = not os.path.exists(path)
-    f = open(path, "a", newline="", buffering=1)
-    w = csv.writer(f)
-    if new:
-        w.writerow(["timestamp", "iso_time",
-                    "t_int", "h_int", "td_int",
-                    "t_ext", "h_ext", "td_ext",
-                    "fan_on"])
+    path = os.path.join(LOG_DIR, f"tp_{datetime.now():%Y-%m-%d}.csv")
+    fresh = not os.path.exists(path)
+    fp = open(path, "a", newline="", buffering=1)
+    writer = csv.writer(fp)
+    if fresh:
+        writer.writerow([
+            "timestamp", "iso_time",
+            "t_int", "h_int", "td_int",
+            "t_ext", "h_ext", "td_ext",
+            "fan_on",
+        ])
     print(f"Logfile: {path}")
-    return f, w
+    return fp, writer
 
 
-def sample(dev: str | None) -> dict | None:
+# --- Hauptschleife --------------------------------------------------------
+def sample(dev):
     if dev is None:
         return None
-    werte = read_sensor(dev)
-    if werte is None:
+    raw = read_dht(dev)
+    if raw is None:
         return None
-    t, h = werte
+    t, h = raw
     return {"t": t, "h": h, "td": dewpoint(t, h)}
 
 
-def main() -> int:
+def parse_args():
     ap = argparse.ArgumentParser(description="Taupunktlüftung mit Web-UI")
-    ap.add_argument("--pin", type=int, default=DHT_PIN_INT, help="interner DHT (Default: 4)")
-    ap.add_argument("--pin-ext", type=int, default=DHT_PIN_EXT, help="externer DHT (Default: 26)")
-    ap.add_argument("--no-ext", action="store_true", help="ohne zweiten Sensor")
-    ap.add_argument("--port", type=int, default=WEB_PORT)
-    ap.add_argument("--host", default=WEB_HOST)
-    ap.add_argument("--no-web", action="store_true")
-    args = ap.parse_args()
+    ap.add_argument("--pin",     type=int, default=PIN_INTERN, help="interner DHT (Default 4)")
+    ap.add_argument("--pin-ext", type=int, default=PIN_EXTERN, help="externer DHT (Default 26)")
+    ap.add_argument("--no-ext",  action="store_true", help="ohne zweiten Sensor laufen")
+    ap.add_argument("--host",    default=WEB_HOST)
+    ap.add_argument("--port",    type=int, default=WEB_PORT)
+    ap.add_argument("--no-web",  action="store_true", help="Web-UI deaktivieren")
+    return ap.parse_args()
 
+
+def start_web(state, fan, host, port):
+    app = build_app(state, fan)
+    threading.Thread(
+        target=lambda: app.run(host=host, port=port,
+                               debug=False, use_reloader=False, threaded=True),
+        name="web",
+        daemon=True,
+    ).start()
+    print(f"Web-UI: http://{host}:{port}/")
+
+
+def main():
+    args = parse_args()
     pins = [args.pin] + ([] if args.no_ext else [args.pin_ext])
-    print(f"Lade dht11-Overlays für GPIOs {pins} …")
+    print(f"Lade dht11-Overlay für GPIO {pins} …")
     try:
         devs = load_overlays(pins)
     except (subprocess.CalledProcessError, RuntimeError) as e:
-        print(f"Fehler: {e}", file=sys.stderr)
+        print(f"Fehler beim Laden der Overlays: {e}", file=sys.stderr)
         return 1
+
     dev_int = devs[args.pin]
     dev_ext = devs.get(args.pin_ext) if not args.no_ext else None
     print("STRG+C zum Beenden.\n")
 
-    log_f, log_w = open_log()
+    log_fp, log_writer = open_logfile()
     fan = Fan()
-    state: dict = {}
+    state = {}
 
     if not args.no_web:
-        app = build_app(state, fan)
-        threading.Thread(
-            target=lambda: app.run(host=args.host, port=args.port,
-                                   debug=False, use_reloader=False, threaded=True),
-            name="web", daemon=True,
-        ).start()
-        print(f"Web-UI: http://{args.host}:{args.port}/")
+        start_web(state, fan, args.host, args.port)
 
     print(f"{'Zeit':<10} {'T-int':>6} {'T-ext':>6} {'ΔT':>6} {'Td-int':>7} {'Td-ext':>7}")
     print("-" * 50)
+
     try:
         while True:
-            t0 = time.monotonic()
-            si = sample(dev_int)
-            se = sample(dev_ext)
+            tick = time.monotonic()
+            s_int = sample(dev_int)
+            s_ext = sample(dev_ext)
+
             now = time.time()
             iso = datetime.fromtimestamp(now).isoformat(timespec="seconds")
-            state["int"] = si
-            state["ext"] = se
-            fan.update(si["t"] if si else None, se["t"] if se else None)
 
-            def fmt(v, w, p):
-                return f"{v:>{w}.{p}f}" if v is not None else f"{'–':>{w}}"
-            ti = si["t"] if si else None
-            te = se["t"] if se else None
-            dt = (te - ti) if (ti is not None and te is not None) else None
-            print(f"{iso[11:]:<10} {fmt(ti,6,1)} {fmt(te,6,1)} {fmt(dt,6,2)} "
-                  f"{fmt(si['td'] if si else None,7,2)} "
-                  f"{fmt(se['td'] if se else None,7,2)}  "
-                  f"{'[FAN]' if fan.on else ''}")
+            state["int"] = s_int
+            state["ext"] = s_ext
 
-            log_w.writerow([
+            t_int = s_int["t"] if s_int else None
+            t_ext = s_ext["t"] if s_ext else None
+            fan.update(t_int, t_ext)
+
+            def cell(value, width, prec):
+                return f"{value:>{width}.{prec}f}" if value is not None else f"{'–':>{width}}"
+
+            delta = (t_ext - t_int) if (t_int is not None and t_ext is not None) else None
+            print(
+                f"{iso[11:]:<10} "
+                f"{cell(t_int, 6, 1)} {cell(t_ext, 6, 1)} {cell(delta, 6, 2)} "
+                f"{cell(s_int['td'] if s_int else None, 7, 2)} "
+                f"{cell(s_ext['td'] if s_ext else None, 7, 2)}  "
+                f"{'[FAN]' if fan.on else ''}"
+            )
+
+            log_writer.writerow([
                 f"{now:.0f}", iso,
-                f"{si['t']:.2f}" if si else "", f"{si['h']:.2f}" if si else "",
-                f"{si['td']:.2f}" if si else "",
-                f"{se['t']:.2f}" if se else "", f"{se['h']:.2f}" if se else "",
-                f"{se['td']:.2f}" if se else "",
+                f"{s_int['t']:.2f}"  if s_int else "",
+                f"{s_int['h']:.2f}"  if s_int else "",
+                f"{s_int['td']:.2f}" if s_int else "",
+                f"{s_ext['t']:.2f}"  if s_ext else "",
+                f"{s_ext['h']:.2f}"  if s_ext else "",
+                f"{s_ext['td']:.2f}" if s_ext else "",
                 "1" if fan.on else "0",
             ])
-            time.sleep(max(0.0, INTERVAL_S - (time.monotonic() - t0)))
+
+            time.sleep(max(0.0, LOOP_INTERVAL - (time.monotonic() - tick)))
     except KeyboardInterrupt:
         print("\nBeendet.")
     finally:
         fan.shutdown()
-        log_f.close()
-        unload_overlay()
+        log_fp.close()
+        unload_overlays()
     return 0
 
 
