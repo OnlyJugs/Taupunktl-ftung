@@ -4,7 +4,8 @@ Dieses Projekt entsteht auf einem **Raspberry Pi 4B** mit dem **Joy-Pi**-Aufsatz
 
 | Datei | Zweck |
 |-------|-------|
-| [taupunkt.py](taupunkt.py) | Liest Temperatur/Feuchte vom AM2302/DHT22-Sensor und berechnet den Taupunkt. |
+| [taupunkt.py](taupunkt.py) | Liest Temperatur/Feuchte vom AM2302/DHT22-Sensor, berechnet den Taupunkt, steuert den Lüfter und stellt eine Web-UI bereit. |
+| [find_dht.py](find_dht.py) | Probiert mehrere GPIOs durch, um zu finden, an welchem Pin ein DHT-Sensor antwortet (z. B. der intern verdrahtete Joy-Pi-DHT auf GPIO 4). |
 | [fan_test.py](fan_test.py) | Interaktiver Test eines Lüfters (oder anderen Aktors) per GPIO inkl. Software-PWM. |
 
 Langfristiges Ziel: anhand der Taupunkt-Differenz zwischen Innen- und Außensensor automatisch einen Lüfter ein- und ausschalten. Aktuell sind beide Bausteine getrennt – Sensorlesung und Aktor-Ansteuerung – und können unabhängig voneinander getestet werden.
@@ -142,23 +143,54 @@ gpiod.request_lines(
 
 ## 3. Zusammenspiel und Ausblick
 
-Beide Skripte sind aktuell **eigenständig**. Eine vollständige Taupunktlüftung könnte daraus wie folgt entstehen:
+Beide Sensorlesung und Lüftersteuerung laufen mittlerweile in
+[taupunkt.py](taupunkt.py) zusammen. Zusätzlich startet das Skript einen
+kleinen **Flask-Webserver** (Default-Port 8080) mit Live-Anzeige der
+aktuellen Messwerte (Aktualisierung jede Sekunde via `fetch('/api/data')`).
+Die Web-UI erlaubt außerdem, die Hysterese-Schwellen
+($T_{d,\text{on}}$, $T_{d,\text{off}}$) zur Laufzeit zu ändern und den
+Lüfter manuell `EIN` / `AUS` zu schalten bzw. wieder in den Automatik-Modus
+zu versetzen. Die Manuell-Logik sitzt im `FanController` und wirkt
+unmittelbar – Mindest-Lauf-/Pausenzeiten greifen nur im Automatikmodus.
 
-1. Zwei Sensoren (innen/außen) parallel auslesen (zweites Overlay-Device oder zweiter Pin).
-2. Differenz $\Delta T_d = T_{d,\text{innen}} - T_{d,\text{außen}}$ mit Hysterese auswerten.
-3. Lüfter über die GPIO-/PWM-Logik aus [fan_test.py](fan_test.py) ein-/ausschalten, sobald $\Delta T_d$ einen Schwellwert überschreitet (typisch: einschalten ab ≈ 3 K, ausschalten unter ≈ 1 K).
-4. Optional: Logging (CSV/SQLite), MQTT-Anbindung, Web-UI.
+### Endpunkte
+
+| Endpoint | Methode | Zweck |
+|----------|---------|-------|
+| `/` | GET | HTML-Oberfläche mit Live-Daten und Override-Formular |
+| `/api/data` | GET | JSON: `{ last, fan_on, settings, history }` |
+| `/api/settings` | POST | JSON-Body mit `td_on`, `td_off`, `manual_mode` (`auto`/`on`/`off`) |
+
+### Sensor-Pin finden
+
+Auf dem Joy-Pi sitzt zusätzlich zum SERV01-Anschluss ein onboard
+verdrahteter DHT (laut Doku BCM GPIO 4). [find_dht.py](find_dht.py) lädt
+das `dht11`-Overlay nacheinander auf eine Liste Pins (Default: 4, 17, 22,
+26, 27) und meldet, auf welchen Pins der Treiber gültige Werte liest.
+
+```bash
+sudo python3 find_dht.py
+sudo python3 taupunkt.py --pin 4   # mit gefundenem Pin starten
+```
+
+### Weiter offen
+
+1. Zwei Sensoren (innen/außen) parallel auslesen und die Differenz
+   $\Delta T_d$ statt eines absoluten Schwellwerts auswerten.
+2. Optional: MQTT-Anbindung, persistente Speicherung der Settings
+   über Programmstarts hinweg.
 
 ## 4. Abhängigkeiten
 
 - Python ≥ 3.10 (wegen `from __future__ import annotations` und Union-Syntax `str | None`)
 - Systempakete: `device-tree-compiler`/`dtoverlay` (in Raspberry-Pi-OS enthalten)
-- Python-Pakete: [gpiod](fan_test.py#L20) (`pip install gpiod` – v2-API)
+- Python-Pakete: [gpiod](fan_test.py#L20) (`pip install gpiod` – v2-API), [flask](taupunkt.py) (`pip install flask`, optional – ohne Flask läuft `taupunkt.py` ohne Web-UI weiter)
 - Kernel-Modul: `dht11` (Standard im Raspberry-Pi-OS-Kernel)
 
 ## 5. Dateiübersicht
 
-- [taupunkt.py](taupunkt.py) – Sensorlesung + Taupunktberechnung
+- [taupunkt.py](taupunkt.py) – Sensorlesung + Taupunktberechnung + Lüftersteuerung + Web-UI
+- [find_dht.py](find_dht.py) – Pin-Scan zum Auffinden eines DHT-Sensors
 - [fan_test.py](fan_test.py) – GPIO-/PWM-Test
 - [README.md](README.md) – Kurzanleitung (Hardware, Start, Magnus-Formel)
 - [DOCUMENTATION.md](DOCUMENTATION.md) – diese ausführliche Dokumentation
