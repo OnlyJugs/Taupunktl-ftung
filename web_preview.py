@@ -10,14 +10,18 @@ Dann im Browser:  http://localhost:8080/
 """
 from __future__ import annotations
 
+import csv
+import io
 import math
 import random
 import sys
 import threading
 import time
 import types
+from collections import deque
+from datetime import datetime
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 
 # gpiod ist auf Windows nicht installiert – Dummys einschieben, bevor
 # taupunkt importiert wird.
@@ -90,7 +94,7 @@ class MockFan:
                 self.diff_off, self.diff_on = self.diff_on, self.diff_off
 
 
-def sensor_thread(state: dict, fan: MockFan) -> None:
+def sensor_thread(state: dict, fan: MockFan, history: deque) -> None:
     """Mockt zwei Sensoren: intern fast konstant, extern schwankt um intern."""
     t0 = time.time()
     while True:
@@ -108,13 +112,20 @@ def sensor_thread(state: dict, fan: MockFan) -> None:
         fan.update(td_i, td_e)
         state["int"] = {"t": t_i, "h": h_i, "td": td_i}
         state["ext"] = {"t": t_e, "h": h_e, "td": td_e}
+        history.append({
+            "time":   datetime.fromtimestamp(now).strftime("%H:%M:%S"),
+            "t_int":  t_i, "h_int":  h_i, "td_int": td_i,
+            "t_ext":  t_e, "h_ext":  h_e, "td_ext": td_e,
+            "fan":    fan.on,
+        })
         time.sleep(1.0)
 
 
 def main() -> None:
     state: dict = {}
     fan = MockFan()
-    threading.Thread(target=sensor_thread, args=(state, fan), daemon=True).start()
+    history: deque = deque(maxlen=120)
+    threading.Thread(target=sensor_thread, args=(state, fan, history), daemon=True).start()
 
     app = Flask(__name__)
     import logging
@@ -128,6 +139,29 @@ def main() -> None:
     def _data():
         return jsonify({"int": state.get("int"), "ext": state.get("ext"),
                         "fan": fan.on, "s": fan.settings()})
+
+    @app.get("/api/history")
+    def _history():
+        return jsonify({"rows": list(history)})
+
+    @app.get("/api/download")
+    def _download():
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["time", "t_int", "h_int", "td_int",
+                    "t_ext", "h_ext", "td_ext", "fan_on"])
+        for r in history:
+            w.writerow([r["time"],
+                        f"{r['t_int']:.2f}"  if r['t_int']  is not None else "",
+                        f"{r['h_int']:.2f}"  if r['h_int']  is not None else "",
+                        f"{r['td_int']:.2f}" if r['td_int'] is not None else "",
+                        f"{r['t_ext']:.2f}"  if r['t_ext']  is not None else "",
+                        f"{r['h_ext']:.2f}"  if r['h_ext']  is not None else "",
+                        f"{r['td_ext']:.2f}" if r['td_ext'] is not None else "",
+                        "1" if r["fan"] else "0"])
+        fname = f"tp_preview_{datetime.now():%Y-%m-%d}.csv"
+        return Response(buf.getvalue(), mimetype="text/csv",
+                        headers={"Content-Disposition": f"attachment; filename={fname}"})
 
     @app.post("/api/settings")
     def _settings():

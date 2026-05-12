@@ -19,11 +19,12 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from datetime import datetime
 
 import gpiod
 from gpiod.line import Bias, Direction, Value
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file, abort
 
 
 # --- Konfiguration ---------------------------------------------------------
@@ -34,9 +35,10 @@ FAN_ACTIVE_LOW = True       # MOSFET-Treiber: LOW schaltet ein
 FAN_CHIP   = "/dev/gpiochip0"
 
 LOOP_INTERVAL  = 3.0        # Sekunden zwischen Messungen
-FAN_MIN_HOLD   = 60.0       # Mindesthaltezeit gegen Flattern (s)
+FAN_MIN_HOLD   = 5.0        # Mindesthaltezeit gegen Flattern (s)
 DIFF_ON_DEFAULT  = 2.0      # Lüfter EIN ab ΔTd (Td_ext - Td_int) °C
 DIFF_OFF_DEFAULT = 0.5      # Lüfter AUS bei ΔTd ≤ … °C
+HISTORY_SECONDS  = 60       # Anzeigedauer im Verlauf (s)
 
 WEB_HOST = "0.0.0.0"
 WEB_PORT = 8080
@@ -244,6 +246,21 @@ INDEX_HTML = """<!doctype html><html lang="de"><meta charset="utf-8">
  <button>Speichern</button>
 </form></fieldset>
 
+<h2>Verlauf (letzte Minute)</h2>
+<div style="margin:.35rem 0">
+ <a id=dl href="/api/download" download><button type=button>CSV herunterladen</button></a>
+</div>
+<div style="overflow:auto">
+<table id=hist style="border-collapse:collapse;font-size:.85rem;width:100%">
+ <thead><tr style="text-align:right;background:#f0f0f0">
+  <th style="padding:.25rem .5rem;text-align:left">Zeit</th>
+  <th style="padding:.25rem .5rem">T int</th><th style="padding:.25rem .5rem">RH int</th><th style="padding:.25rem .5rem">Td int</th>
+  <th style="padding:.25rem .5rem">T ext</th><th style="padding:.25rem .5rem">RH ext</th><th style="padding:.25rem .5rem">Td ext</th>
+  <th style="padding:.25rem .5rem">ΔTd</th><th style="padding:.25rem .5rem">Fan</th>
+ </tr></thead><tbody></tbody>
+</table>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
 let dirty = false;
@@ -296,10 +313,35 @@ $('f').onsubmit = async e => {
 
 refresh();
 setInterval(refresh, 1000);
+
+function fmt(v, p){ return (v===null||v===undefined) ? '–' : Number(v).toFixed(p); }
+async function refreshHistory(){
+  try {
+    const r = await (await fetch('/api/history', {cache:'no-store'})).json();
+    const tb = document.querySelector('#hist tbody');
+    const rows = (r.rows||[]).slice().reverse().map(x => {
+      const dtd = (x.td_int!=null && x.td_ext!=null) ? (x.td_ext - x.td_int) : null;
+      return `<tr style="text-align:right">
+        <td style="padding:.2rem .5rem;text-align:left;font-variant-numeric:tabular-nums">${x.time}</td>
+        <td style="padding:.2rem .5rem">${fmt(x.t_int,1)}</td>
+        <td style="padding:.2rem .5rem">${fmt(x.h_int,1)}</td>
+        <td style="padding:.2rem .5rem">${fmt(x.td_int,2)}</td>
+        <td style="padding:.2rem .5rem">${fmt(x.t_ext,1)}</td>
+        <td style="padding:.2rem .5rem">${fmt(x.h_ext,1)}</td>
+        <td style="padding:.2rem .5rem">${fmt(x.td_ext,2)}</td>
+        <td style="padding:.2rem .5rem">${fmt(dtd,2)}</td>
+        <td style="padding:.2rem .5rem">${x.fan?'EIN':'AUS'}</td>
+      </tr>`;
+    }).join('');
+    tb.innerHTML = rows || '<tr><td colspan=9 style="padding:.5rem;opacity:.6">noch keine Daten</td></tr>';
+  } catch(e) {}
+}
+refreshHistory();
+setInterval(refreshHistory, 2000);
 </script></html>"""
 
 
-def build_app(state, fan):
+def build_app(state, fan, history, logfile_path_getter):
     app = Flask(__name__)
     import logging
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
@@ -316,6 +358,18 @@ def build_app(state, fan):
             "fan": fan.on,
             "s":   fan.settings(),
         })
+
+    @app.get("/api/history")
+    def api_history():
+        return jsonify({"rows": list(history)})
+
+    @app.get("/api/download")
+    def api_download():
+        path = logfile_path_getter()
+        if not path or not os.path.exists(path):
+            abort(404)
+        return send_file(path, mimetype="text/csv", as_attachment=True,
+                         download_name=os.path.basename(path))
 
     @app.post("/api/settings")
     def api_settings():
@@ -373,8 +427,8 @@ def parse_args():
     return ap.parse_args()
 
 
-def start_web(state, fan, host, port):
-    app = build_app(state, fan)
+def start_web(state, fan, history, logfile_path_getter, host, port):
+    app = build_app(state, fan, history, logfile_path_getter)
     threading.Thread(
         target=lambda: app.run(host=host, port=port,
                                debug=False, use_reloader=False, threaded=True),
@@ -399,11 +453,13 @@ def main():
     print("STRG+C zum Beenden.\n")
 
     log_fp, log_writer = open_logfile()
+    log_path = log_fp.name
     fan = Fan()
     state = {}
+    history = deque(maxlen=max(1, int(HISTORY_SECONDS / max(LOOP_INTERVAL, 0.1)) + 2))
 
     if not args.no_web:
-        start_web(state, fan, args.host, args.port)
+        start_web(state, fan, history, lambda: log_path, args.host, args.port)
 
     print(f"{'Zeit':<10} {'T-int':>6} {'T-ext':>6} {'ΔTd':>6} {'Td-int':>7} {'Td-ext':>7}")
     print("-" * 50)
@@ -448,6 +504,17 @@ def main():
                 f"{s_ext['td']:.2f}" if s_ext else "",
                 "1" if fan.on else "0",
             ])
+
+            history.append({
+                "time":   iso[11:],
+                "t_int":  s_int["t"]  if s_int else None,
+                "h_int":  s_int["h"]  if s_int else None,
+                "td_int": s_int["td"] if s_int else None,
+                "t_ext":  s_ext["t"]  if s_ext else None,
+                "h_ext":  s_ext["h"]  if s_ext else None,
+                "td_ext": s_ext["td"] if s_ext else None,
+                "fan":    fan.on,
+            })
 
             time.sleep(max(0.0, LOOP_INTERVAL - (time.monotonic() - tick)))
     except KeyboardInterrupt:
