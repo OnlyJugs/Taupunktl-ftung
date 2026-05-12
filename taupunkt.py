@@ -204,7 +204,7 @@ INDEX_HTML = """<!doctype html><html lang="de"><meta charset="utf-8">
 <title>Taupunktlüftung</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
- body{font-family:system-ui,sans-serif;max-width:720px;margin:1.5rem auto;padding:0 1rem}
+ body{font-family:system-ui,sans-serif;max-width:900px;margin:1.5rem auto;padding:0 1rem}
  h2{margin:1.25rem 0 .25rem;font-size:1.05rem}
  .grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:.5rem 1.25rem;margin:.25rem 0 1rem}
  .v{font-size:1.4rem;font-weight:600}.l{opacity:.7;font-size:.8rem}
@@ -213,18 +213,8 @@ INDEX_HTML = """<!doctype html><html lang="de"><meta charset="utf-8">
 </style>
 <h1>Taupunktlüftung</h1>
 
-<h2>Sensor intern (GPIO 4)</h2>
-<div class=grid>
- <div><div class=l>Temperatur</div><div class=v id=t1>–</div></div>
- <div><div class=l>Luftfeuchte</div><div class=v id=h1>–</div></div>
- <div><div class=l>Taupunkt</div><div class=v id=td1>–</div></div>
-</div>
-
-<h2>Sensor extern (GPIO 26)</h2>
-<div class=grid>
- <div><div class=l>Temperatur</div><div class=v id=t2>–</div></div>
- <div><div class=l>Luftfeuchte</div><div class=v id=h2>–</div></div>
- <div><div class=l>Taupunkt</div><div class=v id=td2>–</div></div>
+<div style="position:relative;height:340px;margin:.5rem 0 1rem">
+ <canvas id=chartAll></canvas>
 </div>
 
 <h2>Status</h2>
@@ -250,6 +240,8 @@ INDEX_HTML = """<!doctype html><html lang="de"><meta charset="utf-8">
 <div style="margin:.35rem 0">
  <a id=dl href="/api/download" download><button type=button>CSV herunterladen</button></a>
 </div>
+
+<details><summary style="cursor:pointer;margin:.25rem 0">Tabelle anzeigen</summary>
 <div style="overflow:auto">
 <table id=hist style="border-collapse:collapse;font-size:.85rem;width:100%">
  <thead><tr style="text-align:right;background:#f0f0f0">
@@ -260,6 +252,9 @@ INDEX_HTML = """<!doctype html><html lang="de"><meta charset="utf-8">
  </tr></thead><tbody></tbody>
 </table>
 </div>
+</details>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -270,17 +265,9 @@ function fillIfIdle(id, v){
   if (!dirty && document.activeElement !== el) el.value = v;
 }
 
-function showSensor(s, tId, hId, tdId){
-  $(tId).textContent  = s ? s.t.toFixed(1)  + ' °C' : '–';
-  $(hId).textContent  = s ? s.h.toFixed(1)  + ' %'  : '–';
-  $(tdId).textContent = s ? s.td.toFixed(2) + ' °C' : '–';
-}
-
 async function refresh(){
   try {
     const d = await (await fetch('/api/data', {cache:'no-store'})).json();
-    showSensor(d.int, 't1','h1','td1');
-    showSensor(d.ext, 't2','h2','td2');
     if (d.int && d.ext) {
       const delta = d.ext.td - d.int.td;
       $('dt').textContent = (delta >= 0 ? '+' : '') + delta.toFixed(2) + ' °C';
@@ -315,11 +302,57 @@ refresh();
 setInterval(refresh, 1000);
 
 function fmt(v, p){ return (v===null||v===undefined) ? '–' : Number(v).toFixed(p); }
+
+let chartAll;
+function makeCharts(){
+  if (!window.Chart) return false;
+  const ds = (label, color, axis) => ({
+    label, data:[], borderColor:color, backgroundColor:color+'22',
+    tension:.3, pointRadius:0, borderWidth:2, yAxisID:axis,
+  });
+  chartAll = new Chart(document.getElementById('chartAll'), {
+    type:'line',
+    data:{labels:[], datasets:[
+      ds('Temperatur intern',       '#d9534f', 'yT'),
+      ds('Taupunkt intern',         '#f0ad4e', 'yT'),
+      ds('Luftfeuchtigkeit intern', '#5cb85c', 'yH'),
+      ds('Temperatur extern',       '#0275d8', 'yT'),
+      ds('Taupunkt extern',         '#9b59b6', 'yT'),
+      ds('Luftfeuchtigkeit extern', '#20c997', 'yH'),
+    ]},
+    options:{
+      responsive:true, maintainAspectRatio:false, animation:false,
+      interaction:{mode:'index', intersect:false},
+      plugins:{legend:{position:'bottom', labels:{boxWidth:18, usePointStyle:false}}},
+      scales:{
+        x:{ticks:{maxRotation:0, autoSkip:true, maxTicksLimit:8}},
+        yT:{position:'left',  title:{display:true,text:'°C (Temperatur / Taupunkt)'}},
+        yH:{position:'right', title:{display:true,text:'Luftfeuchtigkeit %'}, grid:{drawOnChartArea:false},
+            suggestedMin:0, suggestedMax:100},
+      },
+    },
+  });
+  return true;
+}
+
+function updateCharts(rows){
+  if (!chartAll && !makeCharts()) return;
+  chartAll.data.labels = rows.map(x => x.time);
+  const cols = [
+    r => r.t_int, r => r.td_int, r => r.h_int,
+    r => r.t_ext, r => r.td_ext, r => r.h_ext,
+  ];
+  cols.forEach((f, i) => { chartAll.data.datasets[i].data = rows.map(f); });
+  chartAll.update('none');
+}
+
 async function refreshHistory(){
   try {
     const r = await (await fetch('/api/history', {cache:'no-store'})).json();
+    const rows = r.rows || [];
+    updateCharts(rows);
     const tb = document.querySelector('#hist tbody');
-    const rows = (r.rows||[]).slice().reverse().map(x => {
+    const trs = rows.slice().reverse().map(x => {
       const dtd = (x.td_int!=null && x.td_ext!=null) ? (x.td_ext - x.td_int) : null;
       return `<tr style="text-align:right">
         <td style="padding:.2rem .5rem;text-align:left;font-variant-numeric:tabular-nums">${x.time}</td>
@@ -333,7 +366,7 @@ async function refreshHistory(){
         <td style="padding:.2rem .5rem">${x.fan?'EIN':'AUS'}</td>
       </tr>`;
     }).join('');
-    tb.innerHTML = rows || '<tr><td colspan=9 style="padding:.5rem;opacity:.6">noch keine Daten</td></tr>';
+    tb.innerHTML = trs || '<tr><td colspan=9 style="padding:.5rem;opacity:.6">noch keine Daten</td></tr>';
   } catch(e) {}
 }
 refreshHistory();
