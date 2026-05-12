@@ -53,7 +53,7 @@ class MockFan:
         self.mode = "diff"
         self.lock = threading.Lock()
 
-    def update(self, t_int, t_ext) -> None:
+    def update(self, td_int, td_ext) -> None:
         with self.lock:
             mode, on_th, off_th = self.mode, self.diff_on, self.diff_off
         if mode == "on":
@@ -62,9 +62,9 @@ class MockFan:
         if mode == "off":
             self.on = False
             return
-        if t_int is None or t_ext is None:
+        if td_int is None or td_ext is None:
             return
-        d = t_ext - t_int
+        d = td_ext - td_int
         if not self.on and d >= on_th:
             self.on = True
         elif self.on and d <= off_th:
@@ -103,9 +103,11 @@ def sensor_thread(state: dict, fan: MockFan) -> None:
         t_e = t_i + 2.0 * math.sin(phase * 2 * math.pi) + random.uniform(-0.1, 0.1)
         h_e = 60.0 + 10.0 * math.sin(phase * 2 * math.pi + 0.5) + random.uniform(-1, 1)
         h_e = max(20.0, min(95.0, h_e))
-        fan.update(t_i, t_e)
-        state["int"] = {"t": t_i, "h": h_i, "td": dewpoint(t_i, h_i)}
-        state["ext"] = {"t": t_e, "h": h_e, "td": dewpoint(t_e, h_e)}
+        td_i = dewpoint(t_i, h_i)
+        td_e = dewpoint(t_e, h_e)
+        fan.update(td_i, td_e)
+        state["int"] = {"t": t_i, "h": h_i, "td": td_i}
+        state["ext"] = {"t": t_e, "h": h_e, "td": td_e}
         time.sleep(1.0)
 
 

@@ -34,9 +34,9 @@ FAN_ACTIVE_LOW = True       # MOSFET-Treiber: LOW schaltet ein
 FAN_CHIP   = "/dev/gpiochip0"
 
 LOOP_INTERVAL  = 3.0        # Sekunden zwischen Messungen
-FAN_MIN_HOLD   = 1.0        # Mindesthaltezeit gegen Flattern
-DIFF_ON_DEFAULT  = 5.0      # Lüfter EIN ab ΔT (extern - intern) °C
-DIFF_OFF_DEFAULT = 0.0      # Lüfter AUS bei ΔT ≤ … °C
+FAN_MIN_HOLD   = 60.0       # Mindesthaltezeit gegen Flattern (s)
+DIFF_ON_DEFAULT  = 2.0      # Lüfter EIN ab ΔTd (Td_ext - Td_int) °C
+DIFF_OFF_DEFAULT = 0.5      # Lüfter AUS bei ΔTd ≤ … °C
 
 WEB_HOST = "0.0.0.0"
 WEB_PORT = 8080
@@ -114,7 +114,8 @@ def dewpoint(temp_c, rh):
 class Fan:
     """GPIO-Lüfter mit drei Modi.
 
-    diff  – Automatik: an bei (t_ext - t_int) ≥ diff_on, aus bei ≤ diff_off
+    diff  – Automatik (Taupunktlüftung): an bei (td_ext - td_int) ≥ diff_on,
+            aus bei ≤ diff_off.
     on    – Handbetrieb: immer an
     off   – Handbetrieb: immer aus
     """
@@ -144,7 +145,7 @@ class Fan:
         self.on = on
         self.last_change = time.monotonic()
 
-    def update(self, t_int, t_ext):
+    def update(self, td_int, td_ext):
         with self.lock:
             mode, on_th, off_th = self.mode, self.diff_on, self.diff_off
 
@@ -156,10 +157,10 @@ class Fan:
             if self.on:
                 self._switch(False)
             return
-        # Automatik
-        if t_int is None or t_ext is None:
+        # Automatik (Taupunktdifferenz: extern - intern)
+        if td_int is None or td_ext is None:
             return
-        delta = t_ext - t_int
+        delta = td_ext - td_int
         if time.monotonic() - self.last_change < FAN_MIN_HOLD:
             return
         if not self.on and delta >= on_th:
@@ -226,14 +227,14 @@ INDEX_HTML = """<!doctype html><html lang="de"><meta charset="utf-8">
 
 <h2>Status</h2>
 <div class=grid>
- <div><div class=l>ΔT (extern - intern)</div><div class=v id=dt>–</div></div>
+ <div><div class=l>ΔTd (extern - intern)</div><div class=v id=dt>–</div></div>
  <div><div class=l>Lüfter</div><div class=v id=fan>–</div></div>
  <div></div>
 </div>
 
 <fieldset><legend>Einstellungen</legend><form id=f>
- <label>ΔT EIN (°C): <input type=text inputmode=decimal name=diff_on id=diff_on></label>
- <label>ΔT AUS (°C): <input type=text inputmode=decimal name=diff_off id=diff_off></label>
+ <label>ΔTd EIN (°C): <input type=text inputmode=decimal name=diff_on id=diff_on></label>
+ <label>ΔTd AUS (°C): <input type=text inputmode=decimal name=diff_off id=diff_off></label>
  <label>Modus:
   <select name=mode id=mm>
    <option value=diff>Automatik (Differenz)</option>
@@ -264,7 +265,7 @@ async function refresh(){
     showSensor(d.int, 't1','h1','td1');
     showSensor(d.ext, 't2','h2','td2');
     if (d.int && d.ext) {
-      const delta = d.ext.t - d.int.t;
+      const delta = d.ext.td - d.int.td;
       $('dt').textContent = (delta >= 0 ? '+' : '') + delta.toFixed(2) + ' °C';
     } else {
       $('dt').textContent = '–';
@@ -404,7 +405,7 @@ def main():
     if not args.no_web:
         start_web(state, fan, args.host, args.port)
 
-    print(f"{'Zeit':<10} {'T-int':>6} {'T-ext':>6} {'ΔT':>6} {'Td-int':>7} {'Td-ext':>7}")
+    print(f"{'Zeit':<10} {'T-int':>6} {'T-ext':>6} {'ΔTd':>6} {'Td-int':>7} {'Td-ext':>7}")
     print("-" * 50)
 
     try:
@@ -419,19 +420,21 @@ def main():
             state["int"] = s_int
             state["ext"] = s_ext
 
-            t_int = s_int["t"] if s_int else None
-            t_ext = s_ext["t"] if s_ext else None
-            fan.update(t_int, t_ext)
+            t_int  = s_int["t"]  if s_int else None
+            t_ext  = s_ext["t"]  if s_ext else None
+            td_int = s_int["td"] if s_int else None
+            td_ext = s_ext["td"] if s_ext else None
+            fan.update(td_int, td_ext)
 
             def cell(value, width, prec):
                 return f"{value:>{width}.{prec}f}" if value is not None else f"{'–':>{width}}"
 
-            delta = (t_ext - t_int) if (t_int is not None and t_ext is not None) else None
+            delta_td = (td_ext - td_int) if (td_int is not None and td_ext is not None) else None
             print(
                 f"{iso[11:]:<10} "
-                f"{cell(t_int, 6, 1)} {cell(t_ext, 6, 1)} {cell(delta, 6, 2)} "
-                f"{cell(s_int['td'] if s_int else None, 7, 2)} "
-                f"{cell(s_ext['td'] if s_ext else None, 7, 2)}  "
+                f"{cell(t_int, 6, 1)} {cell(t_ext, 6, 1)} {cell(delta_td, 6, 2)} "
+                f"{cell(td_int, 7, 2)} "
+                f"{cell(td_ext, 7, 2)}  "
                 f"{'[FAN]' if fan.on else ''}"
             )
 
